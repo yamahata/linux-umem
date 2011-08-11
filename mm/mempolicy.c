@@ -2011,6 +2011,7 @@ retry_cpuset:
 		goto retry_cpuset;
 	return page;
 }
+EXPORT_SYMBOL_GPL(alloc_pages_vma);
 
 /**
  * 	alloc_pages_current - Allocate pages.
