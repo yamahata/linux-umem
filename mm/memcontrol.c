@@ -2761,6 +2761,7 @@ int mem_cgroup_cache_charge(struct page *page, struct mm_struct *mm,
 	}
 	return ret;
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_cache_charge);
 
 /*
  * While swap-in, try_charge -> commit or cancel, the page is locked.
