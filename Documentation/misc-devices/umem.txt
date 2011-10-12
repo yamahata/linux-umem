@@ -1,0 +1,303 @@
+User process backed memory driver
+=================================
+
+Intro
+=====
+User process backed memory driver provides /dev/umem device.
+This /dev/umem device is designed for some sort of distributed shared memory.
+Especially post-copy live migration with KVM.
+
+page fault in the area backed by this driver is propagated to (other) server
+process which serves the page contents. Usually the server process fetches
+page contents from the remote machine. Then the faulting process continues.
+
+
+Kernel-User protocol
+====================
+ioctl
+UMEM_INIT: Initialize the umem device with some parameters.
+  IN size: the area size in bytes (which is rounded up to page size)
+  OUT shmem_fd: the file descript to tmpfs that is associated to this umem
+                device This is served as backing store of this umem device.
+
+mmap: Mapping the initialized umem device provides the area which
+      is served by user process.
+      The fault in this area is propagated to umem device via read
+      system call.
+read: kernel notifies a process that pages are faulted by returning
+      page offset in page size in u64 format.
+      umem device is pollable for read.
+write: Process notifies kernel that the page is ready to access
+       by writing page offset in page size in u64 format.
+
+
+operation flow
+==============
+
+                |
+                V
+          open(/dev/umem)
+                |
+                V
+          ioctl(UMEM_INIT)
+                |
+                V
+          Here we have two file descriptors to
+          umem device and shmem file
+                |
+                |                                  daemon process which serves
+                |                                  page fault
+                V
+          fork()---------------------------------------,
+                |                                      |
+                V                                      V
+          close(shmem)                             mmap(shmem file)
+                |                                      |
+                V                                      V
+          mmap(umem device)                       close(shmem file)
+                |                                      |
+                V                                      |
+          close(umem device)                           |
+                |                                      |
+          now the setup is done                        |
+          work on the umem area                        |
+                |                                      |
+                V                                      V
+          access umem area                         (poll and) read(umem)
+                |                                      |
+                V                                      V
+          page fault ------------------------------> read system call returns
+          block                                      page offsets
+                                                       |
+                                                       V
+                                                    create page contents
+                                                    (usually pull the page
+                                                     from remote)
+                                                    write the page contents
+                                                    to the shmem which was
+                                                    mmapped above
+                                                       |
+                                                       V
+          unblock<--------------------------------write(umem, page offsets)
+          the fault handler returns the page      tell kernel which pages are
+          page fault is resolved                  served
+                |
+                |
+                |                                 write to shmem area that
+                |                                 isn't faulted yet
+                |                                      |
+                V                                      V
+          The specified pages<-------------------write(umem, page offsets)
+          are cached                             the unfaulted pages also can
+          so future page fault will              be served proactively
+          be served immediately                        |
+                |                                      |
+                V                                      V
+
+                   repeat until all pages are served
+
+                |                                      |
+                V                                      V
+          the vma becomes anonymous<----------------UMEM_MAKE_VMA_ANONYMOUS
+         (note: I'm not sure if this can be implemented or not)
+                |                                      |
+                V                                      V
+                                                      exit()
+
+
+
+Example code
+============
+#include <err.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+
+#include <linux/umem.h>
+
+#if 1
+#define DPRINTF(format, ...) \
+	printf("%s:%d "format, __func__, __LINE__, ## __VA_ARGS__)
+#else
+#define DPRINTF(format, ...)	do { } while (0)
+#endif
+
+#define DEV_UMEM	"/dev/umem"
+#define UMEM_NR_PAGES	8
+
+struct pages {
+	uint64_t nr;
+	uint64_t pgoffs[0];
+};
+
+static void server(int umem_fd, int shmem_fd, size_t size, size_t page_size)
+{
+	int nr_pages = size / page_size;
+
+	void* shmem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			   shmem_fd, 0);
+	if (shmem == MAP_FAILED) {
+		err(EXIT_FAILURE, "server: mmap(\"shmem\")");
+	}
+	close(shmem_fd);
+
+	ssize_t bufsize = nr_pages * sizeof(uint64_t);
+	struct pages *page_request = malloc(sizeof(*page_request) + bufsize);
+	if (page_request == NULL) {
+		err(EXIT_FAILURE, "server: malloc(\"page_request\")");
+	}
+
+	struct pages *page_cached = malloc(sizeof(*page_cached) + bufsize);
+	if (page_cached == NULL) {
+		err(EXIT_FAILURE, "server: malloc(\"page_cached\")");
+	}
+
+	int fill = 0;
+	fill++;
+	memset(shmem, fill, page_size);
+	page_cached->pgoffs[0] = 0;
+
+	DPRINTF("write: 0\n");
+	ssize_t len = sizeof(page_cached->pgoffs[0]);
+	ssize_t written = write(umem_fd, page_cached->pgoffs, len);
+	if (written < len) {
+		err(EXIT_FAILURE, "server: write");
+	}
+
+	int page_served = 1;
+	while (page_served < nr_pages) {
+		DPRINTF("read\n");
+		len = read(umem_fd, page_request->pgoffs,
+			   sizeof(page_request->pgoffs[0]) * nr_pages);
+		if (len < 0) {
+			err(EXIT_FAILURE, "server: read");
+		}
+		page_request->nr = len / sizeof(page_request->pgoffs[0]);
+
+
+		DPRINTF("request.nr %"PRId64"\n", page_request->nr);
+		page_cached->nr = 0;
+		int i;
+		for (i = 0; i < page_request->nr; ++i) {
+			memset(shmem + page_size * page_request->pgoffs[i],
+			       fill, page_size);
+			fill++;
+			page_cached->pgoffs[page_cached->nr] =
+				page_request->pgoffs[i];
+			page_cached->nr++;
+			DPRINTF("request[%d] %lx fill: %d\n",
+				i, (unsigned long)page_request->pgoffs[i],
+				fill - 1);
+		}
+
+		DPRINTF("write\n");
+		len = sizeof(page_cached->pgoffs[0]) * page_cached->nr;
+		written = write(umem_fd, page_cached->pgoffs, len);
+		if (written < len) {
+			err(EXIT_FAILURE, "server: write");
+		}
+		page_served += page_cached->nr;
+
+
+		sleep(1); /* Wait for the fault handler completion.
+			   * you have to communication with the client.
+			   * sleep() is used here for simplicity.
+			   */
+		for (i = 0; i < page_request->nr; ++i) {
+			madvise(shmem + page_size * page_request->pgoffs[i],
+				page_size, MADV_REMOVE);
+		}
+	}
+
+#if 0
+	/* TODO */
+	DPRINTF("UMEM_MAKE_VMA_ANONYMOUS\n");
+	if (ioctl(umem_fd, UMEM_MAKE_VMA_ANONYMOUS)) {
+		err(EXIT_FAILURE, "server: UMEM_MAKE_VMA_ANONYMOUS");
+	}
+#endif
+	munmap(shmem, size);
+	close(umem_fd);
+}
+
+static void client(int umem_fd, size_t size, size_t page_size)
+{
+	DPRINTF("mmap\n");
+	void *ram = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+			 umem_fd, 0);
+	if (ram == MAP_FAILED) {
+		err(EXIT_FAILURE, "client: mmap");
+	}
+
+	DPRINTF("close\n");
+	close(umem_fd);
+
+	/* do some tasks on the umem area */
+	int pages[] = {7, 1, 6, 2, 0, 5, 3, 4};
+	int val[UMEM_NR_PAGES];
+	int i;
+	for (i = 0; i < UMEM_NR_PAGES; ++i) {
+		if (i == 2 || i == 6)
+			sleep(1);
+		DPRINTF("access to %d\n", pages[i]);
+		fflush(stdout);
+		val[i] = *(uint8_t*)(ram + page_size * pages[i]);
+		DPRINTF("page:%d val[i=%d]=%d\n", pages[i], i, val[i]);
+	}
+
+	/* done */
+	munmap(ram, size);
+}
+
+int main(int argc, char **argv)
+{
+
+	int umem_fd = open(DEV_UMEM, O_RDWR);
+	if (umem_fd < 0) {
+		perror("can't open "DEV_UMEM);
+		exit(EXIT_FAILURE);
+	}
+	long page_size = sysconf(_SC_PAGESIZE);
+	struct umem_init uinit = {
+		.size = UMEM_NR_PAGES * page_size,
+	};
+	if (ioctl(umem_fd, UMEM_INIT, &uinit) < 0) {
+		err(EXIT_FAILURE, "UMEM_INIT");
+	}
+
+	int shmem_fd = uinit.shmem_fd;
+	size_t size = uinit.size;
+
+	if (ftruncate(shmem_fd, size) < 0) {
+		err(EXIT_FAILURE, "truncate(\"shmem_fd\")");
+	}
+
+	printf("umem_fd %d shmem_fd %d\n", umem_fd, shmem_fd);
+	fflush(stdout);
+
+	pid_t child = fork();
+	if (child < 0) {
+		err(EXIT_FAILURE, "fork");
+	}
+	if (child == 0) {
+		sleep(1);
+		printf("server pid: %d\n", getpid());
+		server(umem_fd, shmem_fd, size, page_size);
+		return 0;
+	}
+
+	printf("qemu pid: %d server pid: %d\n", getpid(), child);
+	close(shmem_fd);
+	sleep(1);	/* wait the daemon is ready
+			 * To make it sure, communication with the server
+			 * is needed. sleep() is used here for simplicity.
+			 */
+	client(umem_fd, size, page_size);
+	return 0;
+}
