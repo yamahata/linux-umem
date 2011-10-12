@@ -15,6 +15,16 @@ config DEVKMEM
 	  kind of kernel debugging operations.
 	  When in doubt, say "N".
 
+config UVMEM
+	tristate "/dev/umem user process backed memory support"
+	default n
+	help
+	  User process backed memory driver provides /dev/umem device.
+	  The /dev/umem device is designed for some sort of distributed
+	  shared memory. Especially post-copy live migration with KVM.
+	  For details please refer to <file:Documentation/misc-devices/umem.txt>
+	  When in doubt, say "N".
+
 config STALDRV
 	bool "Stallion multiport serial support"
 	depends on SERIAL_NONSTANDARD
