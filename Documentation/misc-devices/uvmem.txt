@@ -98,6 +98,10 @@ operation flow
 
                 |                                      |
                 V                                      V
+          the vma becomes anonymous<----------------UVMEM_MAKE_VMA_ANONYMOUS
+         (note: I'm not sure if this can be implemented or not)
+                |                                      |
+                V                                      V
                                                       exit()
 
 
@@ -211,6 +215,13 @@ static void server(int uvmem_fd, int shmem_fd, size_t size, size_t page_size)
 		}
 	}
 
+#if 0
+	/* TODO */
+	DPRINTF("UVMEM_MAKE_VMA_ANONYMOUS\n");
+	if (ioctl(uvmem_fd, UVMEM_MAKE_VMA_ANONYMOUS)) {
+		err(EXIT_FAILURE, "server: UVMEM_MAKE_VMA_ANONYMOUS");
+	}
+#endif
 	munmap(shmem, size);
 	close(uvmem_fd);
 }

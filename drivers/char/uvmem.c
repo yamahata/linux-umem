@@ -581,6 +581,61 @@ out:
 	return nr * sizeof(pgoffs[0]);
 }
 
+static int uvmem_make_vma_anonymous(struct uvmem *uvmem)
+{
+#if 1
+	return -ENOSYS;
+#else
+	unsigned long saddr;
+	unsigned long eaddr;
+	unsigned long addr;
+	unsigned long bit;
+	struct task_struct *task;
+	struct mm_struct *mm;
+
+	spin_lock(&uvmem->lock);
+	if (!uvmem_initialized(uvmem)) {
+		spin_unlock(&uvmem->lock);
+		return -ENXIO;
+	}
+	task = uvmem->task;
+	saddr = uvmem->vm_start;
+	eaddr = saddr + uvmem->size;
+	bit = find_first_zero_bit(uvmem->faulted, uvmem->pgoff_end);
+	if (bit < uvmem->pgoff_end) {
+		spin_unlock(&uvmem->lock);
+		return -EBUSY;
+	}
+	spin_unlock(&uvmem->lock);
+	if (task == NULL)
+		return 0;
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		return 0;
+
+	addr = saddr;
+	down_write(&mm->mmap_sem);
+	while (addr < eaddr) {
+		struct vm_area_struct *vma;
+		vma = find_vma(mm, addr);
+		if (uvmem_is_uvmem_vma(uvmem, vma)) {
+			/* XXX incorrect. race/locking and more fix up */
+			struct file *filp = vma->vm_file;
+			vma->vm_ops->close(vma);
+			vma->vm_ops = NULL;
+			vma->vm_file = NULL;
+			/* vma->vm_flags */
+			fput(filp);
+		}
+		addr = vma->vm_end;
+	}
+	up_write(&mm->mmap_sem);
+
+	mmput(mm);
+	return 0;
+#endif
+}
+
 static unsigned long uvmem_bitmap_bytes(unsigned long pgoff_end)
 {
 	return round_up(pgoff_end, BITS_PER_LONG) / 8;
@@ -720,6 +775,7 @@ static int uvmem_init(struct file *filp, struct uvmem_init *uinit)
 static long uvmem_ioctl(struct file *filp, unsigned int ioctl,
 		       unsigned long arg)
 {
+	struct uvmem *uvmem = filp->private_data;
 	void __user *argp = (void __user *) arg;
 	long ret = 0;
 
@@ -737,6 +793,9 @@ static long uvmem_ioctl(struct file *filp, unsigned int ioctl,
 			ret = -EFAULT;
 		break;
 	}
+	case UVMEM_MAKE_VMA_ANONYMOUS:
+		ret = uvmem_make_vma_anonymous(uvmem);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
