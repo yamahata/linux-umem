@@ -37,5 +37,6 @@ struct uvmem_init {
 
 /* ioctl for uvmem fd */
 #define UVMEM_INIT			_IOWR(UVMEMIO, 0x0, struct uvmem_init)
+#define UVMEM_MAKE_VMA_ANONYMOUS	_IO  (UVMEMIO, 0x1)
 
 #endif /* __LINUX_UVMEM_H */
